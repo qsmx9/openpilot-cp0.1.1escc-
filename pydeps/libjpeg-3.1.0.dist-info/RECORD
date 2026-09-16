@@ -1,0 +1,13 @@
+libjpeg-3.1.0.dist-info/INSTALLER,sha256=zuuue4knoyJ-UwPPXg8fezS7VCrXJQrAP7zeNuwvFQg,4
+libjpeg-3.1.0.dist-info/METADATA,sha256=0jcygrW71u3Xe7gyi4CBtX-SqfmSKtf2h9VQtU37Bfg,125
+libjpeg-3.1.0.dist-info/RECORD,,
+libjpeg-3.1.0.dist-info/REQUESTED,sha256=47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU,0
+libjpeg-3.1.0.dist-info/WHEEL,sha256=Y5ri1FovTIJWiyuoefBnPgMooY4YhyFDJ7c3QEuzA_U,102
+libjpeg-3.1.0.dist-info/top_level.txt,sha256=0-9eCvNtn-o1FkFxRGTJM0U0ZjzMH-6i8ckhkRBWSI4,26
+libjpeg/__init__.py,sha256=yfnb-wCTMpg_IHzTX_10SxTJAlqQBD_VXMAW1fAOYUQ,335
+libjpeg/__pycache__/__init__.cpython-312.pyc,,
+libjpeg/install/include/jconfig.h,sha256=eoZLTUsTpDKkAPAQTTRHkCqj0RWuy8CBOHQz8rY3P58,2065
+libjpeg/install/include/jerror.h,sha256=NTVNFI6m2iNLrNVDUVXQ7B3pwFgzYCIypn8c8YTASSU,16159
+libjpeg/install/include/jmorecfg.h,sha256=gKl_ReyyjYMxAkfuzsKjhltf05ug7MSQtIo2-sYxjiY,14386
+libjpeg/install/include/jpeglib.h,sha256=3D6CIPNLfp-eSGIPXLjcBwg0_rMhS7EruteEeOuynmA,55794
+libjpeg/install/lib/libjpeg.a,sha256=mUZk0DPwyFPlOHr_EPGlD81IuN-jvx-Y9meQvPqxCgg,671474
