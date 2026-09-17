@@ -144,7 +144,19 @@ function agnos_init {
       echo "jeepney already installed."
     else
       echo "jeepney installing to pydeps."
-      python3 -m pip install --target "$PYDEPS" --upgrade jeepney
+      # AGNOS 19's /usr/bin/python3 has neither pip nor ensurepip, and
+      # launch_env.sh does not set PATH, so a bare `python3 -m pip` always
+      # fails here. Pick an interpreter that actually has pip. jeepney is not
+      # shipped in third_party/wheels, so this stays an online install; if it
+      # cannot run, the AGNOS updater falls back to the headless agnos.py path.
+      local jeepney_py
+      jeepney_py="$(pick_pip_python)"
+      if [ -n "$jeepney_py" ]; then
+        "$jeepney_py" -m pip install --target "$PYDEPS" --upgrade jeepney \
+          || echo "jeepney install failed; the AGNOS updater will use the headless fallback."
+      else
+        echo "No usable pip interpreter for jeepney; the AGNOS updater will use the headless fallback."
+      fi
     fi
 
     AGNOS_PY="$DIR/openpilot/system/hardware/tici/agnos.py"
