@@ -106,3 +106,11 @@ Pipfile
 .history
 .ionide
 .vs
+
+# --- 构建产物：上游旧规则用的是仓库根路径，新版代码已迁到 openpilot/ 子目录，
+# 导致 .so / 生成物 / pydeps 曾被误提交。以上规则按当前目录结构补全。
+/prebuilt
+/.build_stamp
+/pydeps/
+/panda/board/obj/
+/panda/board/jungle/obj/
