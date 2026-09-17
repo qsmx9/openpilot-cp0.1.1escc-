@@ -28,6 +28,20 @@ function cleanup_stale_git_lfs_hooks {
   done
 }
 
+function pick_pip_python {
+  # 依次尝试候选解释器，返回第一个能执行 `-m pip` 的。
+  # AGNOS 19 (carrot) 的系统 python3 既没有 pip 也没有 ensurepip，
+  # 而 comma 镜像自带的 /usr/local/venv 里有可用的 pip。
+  local candidate
+  for candidate in python3 /usr/local/venv/bin/python3 /usr/bin/python3; do
+    if command -v "$candidate" >/dev/null 2>&1 && "$candidate" -m pip --version >/dev/null 2>&1; then
+      echo "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
 function ensure_python_package {
   local import_name="$1"
   local package_name="$2"
@@ -40,11 +54,23 @@ function ensure_python_package {
     return 0
   fi
 
-  echo "${package_name} installing from local wheel."
+  local pip_py
+  pip_py="$(pick_pip_python)"
+  if [ -z "$pip_py" ]; then
+    echo "No usable pip interpreter for ${package_name}."
+    if [ "$required" = "1" ]; then
+      echo "Required Python package ${package_name} is unavailable; not starting openpilot."
+      return 1
+    fi
+    echo "Optional Python package ${package_name} is unavailable; continuing without it."
+    return 0
+  fi
+
+  echo "${package_name} installing from local wheel (via ${pip_py})."
   if [ "$install_dependencies" = "1" ]; then
-    python3 -m pip install --no-index --find-links "$wheel_dir" --target "$PYDEPS" --upgrade "$package_name"
+    "$pip_py" -m pip install --no-index --find-links "$wheel_dir" --target "$PYDEPS" --upgrade "$package_name"
   else
-    python3 -m pip install --no-index --no-deps --find-links "$wheel_dir" --target "$PYDEPS" --upgrade "$package_name"
+    "$pip_py" -m pip install --no-index --no-deps --find-links "$wheel_dir" --target "$PYDEPS" --upgrade "$package_name"
   fi
   if [ "$?" = "0" ] && \
      python3 -c "import ${import_name}" > /dev/null 2>&1; then
