@@ -4,10 +4,13 @@ import json
 import lzma
 import os
 from pathlib import Path
+import shutil
 import struct
 import subprocess
+import threading
 import time
 from collections.abc import Generator
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 
@@ -16,6 +19,41 @@ CAIBX_URL = "https://commadist.azureedge.net/agnosupdate/"
 
 AGNOS_MANIFEST_FILE = "openpilot/system/hardware/tici/agnos.json"
 DOWNLOAD_CACHE_DIR = Path(os.getenv("AGNOS_DOWNLOAD_CACHE_DIR", "/data/agnos-update-cache"))
+
+# --- AGNOS image download acceleration ----------------------------------
+# The boot / system partitions live on GitHub Releases. From mainland China a
+# single connection to those hosts often runs at 20-100 KB/s, and the system
+# partition is ~1 GB compressed, so a fresh install stalls here for hours.
+#
+# The manifest URL stays the one authoritative source. On top of it we:
+#   1) probe a few GitHub mirror prefixes and keep whichever answers fastest,
+#   2) fetch the image with several parallel ranged requests, resumable per
+#      chunk, which multiplies throughput on throttled routes.
+# Integrity is still enforced by the compressed_hash / hash / hash_raw sha256
+# checks below, so a misbehaving mirror can only make the download fail, never
+# corrupt the image that gets flashed.
+#
+# Disable the mirrors: AGNOS_MIRROR_PREFIXES="" (empty = manifest URL only).
+# Tune concurrency:   AGNOS_DOWNLOAD_STREAMS=4
+MIRROR_CONFIG_FILE = Path(os.getenv("AGNOS_MIRROR_CONFIG", "/data/agnos-mirrors.txt"))
+DEFAULT_MIRROR_PREFIXES = (
+  "https://gh-proxy.com/",
+  "https://ghfast.top/",
+)
+SPEED_PROBE_BYTES = 512 * 1024
+SPEED_PROBE_TIMEOUT = 20
+PARALLEL_MIN_BYTES = 4 * 1024 * 1024
+CHUNK_MIN_BYTES = 2 * 1024 * 1024
+
+
+def _env_int(name: str, default: int) -> int:
+  try:
+    return max(1, int(os.getenv(name, str(default))))
+  except ValueError:
+    return default
+
+
+DOWNLOAD_STREAMS = _env_int("AGNOS_DOWNLOAD_STREAMS", 8)
 
 
 class StreamingDecompressor:
@@ -73,6 +111,246 @@ def file_checksum(path: Path) -> str:
   return digest.hexdigest()
 
 
+def _mirror_prefixes() -> tuple[str, ...]:
+  """Mirror prefixes: env var > config file > built-in defaults. Empty means off."""
+  env = os.getenv("AGNOS_MIRROR_PREFIXES")
+  if env is not None:
+    return tuple(prefix.strip() for prefix in env.split(",") if prefix.strip())
+  try:
+    if MIRROR_CONFIG_FILE.is_file():
+      lines = MIRROR_CONFIG_FILE.read_text(encoding="utf-8").splitlines()
+      return tuple(line.strip() for line in lines if line.strip() and not line.strip().startswith("#"))
+  except OSError:
+    pass
+  return DEFAULT_MIRROR_PREFIXES
+
+
+def _candidate_urls(url: str) -> list[str]:
+  """The manifest URL first, then the same URL behind each mirror prefix."""
+  candidates = [url]
+  for prefix in _mirror_prefixes():
+    candidates.append(prefix + url)
+
+  seen: set[str] = set()
+  unique = []
+  for candidate in candidates:
+    if candidate not in seen:
+      seen.add(candidate)
+      unique.append(candidate)
+  return unique
+
+
+def _speed_probe(url: str) -> tuple[float | None, bool]:
+  """Grab a small ranged slice. Returns (MB/s or None, server honoured the range)."""
+  try:
+    started = time.time()
+    response = requests.get(url, stream=True, timeout=SPEED_PROBE_TIMEOUT,
+                            headers={'Accept-Encoding': None,
+                                     'Range': f'bytes=0-{SPEED_PROBE_BYTES - 1}'})
+    response.raise_for_status()
+    ranged = response.status_code == 206
+    received = 0
+    try:
+      for chunk in response.iter_content(chunk_size=64 * 1024):
+        received += len(chunk)
+        if received >= SPEED_PROBE_BYTES or time.time() - started > SPEED_PROBE_TIMEOUT:
+          break
+    finally:
+      response.close()
+    if received < SPEED_PROBE_BYTES // 2:
+      return None, ranged
+    return received / 1024 / 1024 / max(time.time() - started, 0.05), ranged
+  except Exception:
+    return None, False
+
+
+def _choose_source(urls: list[str], cloudlog, want_parallel: bool) -> tuple[str, bool]:
+  """Pick the fastest reachable source. Returns (url, use_parallel)."""
+  if len(urls) < 2:
+    return urls[0], want_parallel
+
+  speeds: dict[str, float] = {}
+  ranged: dict[str, bool] = {}
+  with ThreadPoolExecutor(max_workers=len(urls)) as pool:
+    futures = {pool.submit(_speed_probe, url): url for url in urls}
+    for future in as_completed(futures):
+      url = futures[future]
+      speed, honoured_range = future.result()
+      if speed is not None:
+        speeds[url] = speed
+        ranged[url] = honoured_range
+
+  if not speeds:
+    cloudlog.warning("No AGNOS source answered the speed probe; using the manifest URL")
+    return urls[0], want_parallel
+
+  cloudlog.info("AGNOS source probe (MB/s): " + ", ".join(
+    f"{url.split('/')[2]}={speeds[url]:.3f}" for url in sorted(speeds, key=speeds.get, reverse=True)))
+
+  if want_parallel:
+    parallel_ready = {url: speed for url, speed in speeds.items() if ranged.get(url)}
+    if parallel_ready:
+      best = max(parallel_ready, key=parallel_ready.get)
+      return best, True
+    # Fastest source cannot do ranged requests, so it has to go over one stream.
+    return max(speeds, key=speeds.get), False
+
+  return max(speeds, key=speeds.get), False
+
+
+def _chunk_bounds(total: int, streams: int) -> list[tuple[int, int]]:
+  """Split [0, total) into closed intervals, one per stream."""
+  streams = max(1, min(streams, max(1, total // CHUNK_MIN_BYTES)))
+  base = total // streams
+  bounds = []
+  position = 0
+  for index in range(streams):
+    size = base if index < streams - 1 else total - position
+    bounds.append((position, position + size - 1))
+    position += size
+  return bounds
+
+
+def _chunk_paths(partial_path: Path, count: int) -> list[Path]:
+  suffix = partial_path.suffix
+  return [partial_path.with_suffix(suffix + f'.chunk{index:02d}') for index in range(count)]
+
+
+def _cleanup_chunks(partial_path: Path) -> None:
+  for path in partial_path.parent.glob(partial_path.name + '.chunk*'):
+    path.unlink(missing_ok=True)
+
+
+def _download_parallel(url: str, partial_path: Path, total: int, name: str, cloudlog) -> None:
+  """Fetch `total` bytes with parallel ranged requests, then concatenate.
+
+  Each chunk lives in its own file, so its size doubles as resume state: an
+  interrupted download only re-fetches the chunks that are still short.
+  A pre-existing sequential .part file (from the single-stream path) is
+  adopted as the first chunk to avoid re-downloading it.
+  """
+  bounds = _chunk_bounds(total, DOWNLOAD_STREAMS)
+  chunks = _chunk_paths(partial_path, len(bounds))
+
+  if partial_path.is_file() and not chunks[0].exists():
+    pending = partial_path.stat().st_size
+    first_chunk_size = bounds[0][1] - bounds[0][0] + 1
+    if 0 < pending <= first_chunk_size:
+      os.replace(partial_path, chunks[0])
+    else:
+      partial_path.unlink(missing_ok=True)
+
+  completed = 0
+  last_reported = -1
+  progress_lock = threading.Lock()
+
+  def report(increment: int) -> None:
+    nonlocal completed, last_reported
+    with progress_lock:
+      completed += increment
+      percent = int(completed / total * 100)
+      if percent != last_reported:
+        last_reported = percent
+        print(f"Downloading {name}: {percent}", flush=True)
+
+  def worker(start: int, end: int, path: Path) -> None:
+    want = end - start + 1
+    have = path.stat().st_size if path.is_file() else 0
+    if have > want:
+      path.unlink(missing_ok=True)
+      have = 0
+    if have == want:
+      report(want)
+      return
+
+    # Every chunk asks for its own byte range so a stream never pulls more than
+    # the slice it is responsible for. Without this, a chunk other than the
+    # first would receive the head of the file and corrupt the concatenation.
+    request_start = start + have
+    response = requests.get(url, stream=True, timeout=60,
+                            headers={'Accept-Encoding': None,
+                                     'Range': f'bytes={request_start}-{end}'})
+    try:
+      response.raise_for_status()
+      if response.status_code != 206 and request_start > 0:
+        # Server ignored the range; reading it would write the wrong bytes.
+        raise requests.ConnectionError(
+          f"{name}: server ignored the range request for chunk {path.name}")
+
+      with path.open('ab' if have else 'wb') as output:
+        report(have)
+        received = have
+        for chunk in response.iter_content(chunk_size=1024 * 1024):
+          if not chunk:
+            continue
+          output.write(chunk)
+          received += len(chunk)
+          report(len(chunk))
+          if received >= want:
+            break
+        output.flush()
+        os.fsync(output.fileno())
+    finally:
+      response.close()
+
+    if path.stat().st_size != want:
+      raise requests.ConnectionError(
+        f"{name} chunk {path.name} short: {path.stat().st_size} of {want} bytes")
+
+  with ThreadPoolExecutor(max_workers=len(bounds)) as pool:
+    futures = [pool.submit(worker, start, end, path)
+               for (start, end), path in zip(bounds, chunks)]
+    for future in futures:
+      future.result()
+
+  with partial_path.open('wb') as output:
+    for path in chunks:
+      with path.open('rb') as source:
+        shutil.copyfileobj(source, output, 1024 * 1024)
+    output.flush()
+    os.fsync(output.fileno())
+
+  for path in chunks:
+    path.unlink(missing_ok=True)
+
+
+def _download_single(url: str, partial_path: Path, offset: int, expected_size: int | None,
+                     name: str, cloudlog) -> None:
+  """Sequential download, resumable from `offset` via a Range request."""
+  headers: dict[str, str | None] = {'Accept-Encoding': None}
+  if offset:
+    headers['Range'] = f"bytes={offset}-"
+
+  response = requests.get(url, stream=True, headers=headers, timeout=60)
+  response.raise_for_status()
+
+  if offset and response.status_code != 206:
+    cloudlog.warning(f"Server ignored resume for {name}; restarting the cached download")
+    offset = 0
+
+  if expected_size is None:
+    content_length = response.headers.get("Content-Length")
+    expected_size = offset + int(content_length) if content_length is not None else None
+
+  mode = "ab" if offset else "wb"
+  last_p = -1
+  try:
+    with partial_path.open(mode) as output:
+      for chunk in response.iter_content(chunk_size=1024 * 1024):
+        if not chunk:
+          continue
+        output.write(chunk)
+        if expected_size:
+          p = int(output.tell() / expected_size * 100)
+          if p != last_p:
+            last_p = p
+            print(f"Downloading {name}: {p}", flush=True)
+      output.flush()
+      os.fsync(output.fileno())
+  finally:
+    response.close()
+
+
 def download_to_cache(partition: dict, cloudlog) -> Path | None:
   compressed_hash = partition.get("compressed_hash")
   if not isinstance(compressed_hash, str):
@@ -99,49 +377,47 @@ def download_to_cache(partition: dict, cloudlog) -> Path | None:
     partial_path.unlink()
     offset = 0
 
-  headers: dict[str, str | None] = {'Accept-Encoding': None}
-  if offset:
-    headers['Range'] = f"bytes={offset}-"
+  name = partition['name']
+  want_parallel = expected_size is not None and expected_size >= PARALLEL_MIN_BYTES
+  if want_parallel:
+    url, use_parallel = _choose_source(_candidate_urls(partition['url']), cloudlog, True)
+  else:
+    url, use_parallel = partition['url'], False
 
-  cloudlog.info(f"Downloading {partition['name']} cache from byte {offset}")
-  response = requests.get(partition['url'], stream=True, headers=headers, timeout=60)
-  response.raise_for_status()
+  attempts = [(url, use_parallel)]
+  if url != partition['url']:
+    # Fall back to the manifest URL if the probe picked a mirror that then failed.
+    attempts.append((partition['url'], False))
 
-  if offset and response.status_code != 206:
-    cloudlog.warning(f"Server ignored resume for {partition['name']}; restarting the cached download")
-    offset = 0
+  error: Exception | None = None
+  for attempt_url, attempt_parallel in attempts:
+    host = attempt_url.split('/')[2]
+    try:
+      if attempt_parallel:
+        cloudlog.info(f"Downloading {name} ({expected_size} B) in parallel from {host}")
+        _download_parallel(attempt_url, partial_path, expected_size, name, cloudlog)
+      else:
+        cloudlog.info(f"Downloading {name} cache from byte {offset} via {host}")
+        _download_single(attempt_url, partial_path, offset, expected_size, name, cloudlog)
+      error = None
+      break
+    except requests.exceptions.RequestException as exc:
+      error = exc
+      cloudlog.warning(f"AGNOS source {host} failed for {name}: {exc}")
 
-  if expected_size is None:
-    content_length = response.headers.get("Content-Length")
-    expected_size = offset + int(content_length) if content_length is not None else None
-
-  mode = "ab" if offset else "wb"
-  last_p = -1
-  try:
-    with partial_path.open(mode) as output:
-      for chunk in response.iter_content(chunk_size=1024 * 1024):
-        if not chunk:
-          continue
-        output.write(chunk)
-        if expected_size:
-          p = int(output.tell() / expected_size * 100)
-          if p != last_p:
-            last_p = p
-            print(f"Downloading {partition['name']}: {p}", flush=True)
-      output.flush()
-      os.fsync(output.fileno())
-  finally:
-    response.close()
+  if error is not None:
+    raise error
 
   downloaded_size = partial_path.stat().st_size
   if expected_size is not None and downloaded_size != expected_size:
     raise requests.ConnectionError(
-      f"Incomplete {partition['name']} download: {downloaded_size} of {expected_size} bytes"
+      f"Incomplete {name} download: {downloaded_size} of {expected_size} bytes"
     )
   actual_hash = file_checksum(partial_path)
   if actual_hash.lower() != compressed_hash.lower():
     partial_path.unlink(missing_ok=True)
-    raise requests.ConnectionError(f"Compressed {partition['name']} cache hash mismatch: {actual_hash}")
+    _cleanup_chunks(partial_path)
+    raise requests.ConnectionError(f"Compressed {name} cache hash mismatch: {actual_hash}")
 
   os.replace(partial_path, final_path)
   return final_path
