@@ -433,8 +433,9 @@ def main() -> None:
   params = Params()
 
   if params.get_bool("DisableUpdates"):
-    cloudlog.warning("updates are disabled by the DisableUpdates param")
-    exit(0)
+    cloudlog.warning("updates are disabled by the DisableUpdates param; idling instead of exiting to avoid a restart loop")
+    while params.get_bool("DisableUpdates"):
+      time.sleep(60)
 
   with open(LOCK_FILE, 'w') as ov_lock_fd:
     try:
